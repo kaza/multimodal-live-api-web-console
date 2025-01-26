@@ -32,6 +32,7 @@ export type UseLiveAPIResults = {
   connect: () => Promise<void>;
   disconnect: () => Promise<void>;
   volume: number;
+  transcriptions: string[];
 };
 
 export function useLiveAPI({
@@ -49,6 +50,7 @@ export function useLiveAPI({
     model: "models/gemini-2.0-flash-exp",
   });
   const [volume, setVolume] = useState(0);
+  const [transcriptions, setTranscriptions] = useState<string[]>([]);
 
   // register audio for streaming server -> speakers
   useEffect(() => {
@@ -76,16 +78,23 @@ export function useLiveAPI({
     const onAudio = (data: ArrayBuffer) =>
       audioStreamerRef.current?.addPCM16(new Uint8Array(data));
 
+    const onTranscription = (text: string) => {
+      setTranscriptions(prev => [...prev, text]);
+      console.log("Transcription received:", text);
+    };
+
     client
       .on("close", onClose)
       .on("interrupted", stopAudioStreamer)
-      .on("audio", onAudio);
+      .on("audio", onAudio)
+      .on("transcription", onTranscription);
 
     return () => {
       client
         .off("close", onClose)
         .off("interrupted", stopAudioStreamer)
-        .off("audio", onAudio);
+        .off("audio", onAudio)
+        .off("transcription", onTranscription);
     };
   }, [client]);
 
@@ -112,5 +121,6 @@ export function useLiveAPI({
     connect,
     disconnect,
     volume,
+    transcriptions,
   };
 }

@@ -38,6 +38,8 @@ import {
   type LiveConfig,
 } from "../multimodal-live-types";
 import { blobToJSON, base64ToArrayBuffer } from "./utils";
+// Import lamejs as a CommonJS module
+const Lame = require('lamejs');
 
 /**
  * the events that this client will emit
@@ -53,6 +55,7 @@ interface MultimodalLiveClientEventTypes {
   turncomplete: () => void;
   toolcall: (toolCall: ToolCall) => void;
   toolcallcancellation: (toolcallCancellation: ToolCallCancellation) => void;
+  transcription: (text: string) => void;
 }
 
 export type MultimodalLiveAPIClientConnection = {
@@ -69,6 +72,13 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
   public ws: WebSocket | null = null;
   protected config: LiveConfig | null = null;
   public url: string = "";
+  
+  // Existing buffer for model audio
+  protected audioBuffer: Uint8Array | null = null;
+
+  // NEW buffer for user audio
+  protected userAudioBuffer: Uint8Array | null = null;
+
   public getConfig() {
     return { ...this.config };
   }
@@ -81,6 +91,9 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
     url += `?key=${apiKey}`;
     this.url = url;
     this.send = this.send.bind(this);
+
+    // Initialize new user audio buffer
+    this.userAudioBuffer = null;
   }
 
   log(type: string, message: StreamingLog["message"]) {
@@ -167,110 +180,229 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
   }
 
   protected async receive(blob: Blob) {
-    const response: LiveIncomingMessage = (await blobToJSON(
-      blob,
-    )) as LiveIncomingMessage;
-    if (isToolCallMessage(response)) {
-      this.log("server.toolCall", response);
-      this.emit("toolcall", response.toolCall);
-      return;
-    }
-    if (isToolCallCancellationMessage(response)) {
-      this.log("receive.toolCallCancellation", response);
-      this.emit("toolcallcancellation", response.toolCallCancellation);
-      return;
-    }
-
-    if (isSetupCompleteMessage(response)) {
-      this.log("server.send", "setupComplete");
-      this.emit("setupcomplete");
-      return;
-    }
-
-    // this json also might be `contentUpdate { interrupted: true }`
-    // or contentUpdate { end_of_turn: true }
-    if (isServerContentMessage(response)) {
-      const { serverContent } = response;
-      if (isInterrupted(serverContent)) {
-        this.log("receive.serverContent", "interrupted");
-        this.emit("interrupted");
-        return;
-      }
-      if (isTurnComplete(serverContent)) {
-        this.log("server.send", "turnComplete");
-        this.emit("turncomplete");
-        //plausible theres more to the message, continue
-      }
+    const json = await blobToJSON(blob);
+    
+    if (isServerContentMessage(json)) {
+      const serverContent = json.serverContent;
+      this.emit("content", serverContent);
 
       if (isModelTurn(serverContent)) {
-        let parts: Part[] = serverContent.modelTurn.parts;
+        let textContent = '';
 
-        // when its audio that is returned for modelTurn
-        const audioParts = parts.filter(
-          (p) => p.inlineData && p.inlineData.mimeType.startsWith("audio/pcm"),
-        );
-        const base64s = audioParts.map((p) => p.inlineData?.data);
-
-        // strip the audio parts out of the modelTurn
-        const otherParts = difference(parts, audioParts);
-        // console.log("otherParts", otherParts);
-
-        base64s.forEach((b64) => {
-          if (b64) {
-            const data = base64ToArrayBuffer(b64);
-            this.emit("audio", data);
-            this.log(`server.audio`, `buffer (${data.byteLength})`);
+        for (const part of serverContent.modelTurn.parts) {
+          // Handle text parts
+          if (part.text) {
+            textContent += part.text;
           }
-        });
-        if (!otherParts.length) {
-          return;
+          // Handle audio parts
+          if (part.inlineData && part.inlineData.mimeType.startsWith("audio/")) {
+            const chunkData = base64ToArrayBuffer(part.inlineData.data);
+            this.emit("audio", chunkData);
+            
+            // Accumulate audio data
+            if (!this.audioBuffer) {
+              this.audioBuffer = new Uint8Array(chunkData);
+            } else {
+              const newBuffer = new Uint8Array(this.audioBuffer.length + chunkData.byteLength);
+              newBuffer.set(this.audioBuffer);
+              newBuffer.set(new Uint8Array(chunkData), this.audioBuffer.length);
+              this.audioBuffer = newBuffer;
+            }
+          }
         }
 
-        parts = otherParts;
-
-        const content: ModelTurn = { modelTurn: { parts } };
-        this.emit("content", content);
-        this.log(`server.content`, response);
+        // If we have text content, log it
+        if (textContent) {
+          this.log("conversation", `🤖 MODEL: ${textContent}`);
+        }
       }
-    } else {
-      console.log("received unmatched message", response);
+
+      if (isTurnComplete(serverContent)) {
+        this.emit("turncomplete");
+        
+        // Existing model audio transcription
+        if (this.audioBuffer && this.audioBuffer.length > 0) {
+          try {
+            await this.transcribeAudio(this.audioBuffer, 'model');
+          } catch (error) {
+            console.error("Failed to transcribe audio:", error);
+          } finally {
+            this.audioBuffer = null;
+          }
+        }
+
+        // NEW: transcribe user audio at turn complete
+        if (this.userAudioBuffer && this.userAudioBuffer.length > 0) {
+          try {
+            await this.transcribeAudio(this.userAudioBuffer, 'user');
+          } catch (error) {
+            console.error("Failed to transcribe user audio:", error);
+          } finally {
+            this.userAudioBuffer = null;
+          }
+        }
+      }
+
+      if (isInterrupted(serverContent)) {
+        this.emit("interrupted");
+        this.audioBuffer = null;
+      }
+    } else if (isToolCallMessage(json)) {
+      this.emit("toolcall", json.toolCall);
+    } else if (isToolCallCancellationMessage(json)) {
+      this.emit("toolcallcancellation", json.toolCallCancellation);
+    } else if (isSetupCompleteMessage(json)) {
+      this.emit("setupcomplete");
     }
+  }
+
+  protected async transcribeAudio(audioData: Uint8Array, source: 'user' | 'model'): Promise<string | null> {
+    try {
+      if (!audioData || audioData.length === 0) {
+        return '<Not recognizable>';
+      }
+
+      // Convert PCM to WAV first
+      const wavBlob = await this.pcmToWav(audioData);
+      
+      // Convert WAV to base64
+      const base64Audio = await this.blobToBase64(wavBlob);
+      
+      // Extract API key from the URL
+      const apiKey = new URL(this.url).searchParams.get('key');
+      if (!apiKey) {
+        throw new Error('API key not found');
+      }
+      
+      // Create transcription request using Gemini 1.5 Flash
+      const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${apiKey}`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({
+          contents: [{
+            parts: [{
+              text: "Generate a transcript of the speech. Please do not include any other text in the response. If you cannot hear the speech, please only say '<Not recognizable>'."
+            }, {
+              inline_data: {
+                mime_type: "audio/wav",
+                data: base64Audio
+              }
+            }]
+          }]
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`API request failed: ${response.status} ${response.statusText}`);
+      }
+
+      const result = await response.json();
+      const transcription = result.candidates?.[0]?.content?.parts?.[0]?.text;
+      
+      if (transcription && transcription !== '<Not recognizable>') {
+        const emoji = source === 'user' ? '👤 USER' : '🎙️ TRANSCRIBED';
+        this.log("conversation", `${emoji}: ${transcription}`);
+      }
+      
+      return transcription || '<Not recognizable>';
+
+    } catch (error) {
+      console.error("Transcription error:", error);
+      return '<Not recognizable>';
+    }
+  }
+
+  protected async pcmToWav(pcmData: Uint8Array): Promise<Blob> {
+    // WAV header for 24kHz mono 16-bit audio
+    const wavHeader = new ArrayBuffer(44);
+    const view = new DataView(wavHeader);
+    
+    const numChannels = 1;  // Mono
+    const sampleRate = 24000;  // 24kHz
+    const bitsPerSample = 16;  // 16-bit
+    const blockAlign = numChannels * (bitsPerSample / 8);
+    const byteRate = sampleRate * blockAlign;
+    
+    // "RIFF" chunk descriptor
+    view.setUint32(0, 0x52494646, false);  // "RIFF" in ASCII
+    view.setUint32(4, 36 + pcmData.length, true);  // Total file size
+    view.setUint32(8, 0x57415645, false);  // "WAVE" in ASCII
+
+    // "fmt " sub-chunk
+    view.setUint32(12, 0x666D7420, false);  // "fmt " in ASCII
+    view.setUint32(16, 16, true);  // Length of format data
+    view.setUint16(20, 1, true);  // Audio format (1 = PCM)
+    view.setUint16(22, numChannels, true);  // Number of channels
+    view.setUint32(24, sampleRate, true);  // Sample rate
+    view.setUint32(28, byteRate, true);  // Byte rate
+    view.setUint16(32, blockAlign, true);  // Block align
+    view.setUint16(34, bitsPerSample, true);  // Bits per sample
+
+    // "data" sub-chunk
+    view.setUint32(36, 0x64617461, false);  // "data" in ASCII
+    view.setUint32(40, pcmData.length, true);  // Data size
+
+    // Create final WAV buffer
+    const wavArray = new Uint8Array(wavHeader.byteLength + pcmData.length);
+    wavArray.set(new Uint8Array(wavHeader));
+    wavArray.set(pcmData, wavHeader.byteLength);
+
+    return new Blob([wavArray], { type: 'audio/wav' });
+  }
+
+  protected async blobToBase64(blob: Blob): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        if (typeof reader.result === 'string') {
+          // Remove the "data:audio/wav;base64," prefix
+          const base64 = reader.result.split(',')[1];
+          resolve(base64);
+        } else {
+          reject(new Error('Failed to convert blob to base64'));
+        }
+      };
+      reader.onerror = reject;
+      reader.readAsDataURL(blob);
+    });
   }
 
   /**
    * send realtimeInput, this is base64 chunks of "audio/pcm" and/or "image/jpg"
    */
   sendRealtimeInput(chunks: GenerativeContentBlob[]) {
-    let hasAudio = false;
-    let hasVideo = false;
-    for (let i = 0; i < chunks.length; i++) {
-      const ch = chunks[i];
+    for (const ch of chunks) {
       if (ch.mimeType.includes("audio")) {
-        hasAudio = true;
-      }
-      if (ch.mimeType.includes("image")) {
-        hasVideo = true;
-      }
-      if (hasAudio && hasVideo) {
-        break;
+        // Convert base64 to raw PCM
+        const rawData: string = atob(ch.data);
+        const rawBuffer: Uint8Array = new Uint8Array(rawData.length);
+        for (let i = 0; i < rawData.length; i++) {
+          rawBuffer[i] = rawData.charCodeAt(i);
+        }
+
+        // Accumulate user audio
+        if (!this.userAudioBuffer) {
+          this.userAudioBuffer = rawBuffer;
+        } else {
+          const newBuffer: Uint8Array = new Uint8Array(
+            this.userAudioBuffer.length + rawBuffer.length
+          );
+          newBuffer.set(this.userAudioBuffer);
+          newBuffer.set(rawBuffer, this.userAudioBuffer.length);
+          this.userAudioBuffer = newBuffer;
+        }
       }
     }
-    const message =
-      hasAudio && hasVideo
-        ? "audio + video"
-        : hasAudio
-          ? "audio"
-          : hasVideo
-            ? "video"
-            : "unknown";
 
+    // Send the realtime input message to the server
     const data: RealtimeInputMessage = {
       realtimeInput: {
         mediaChunks: chunks,
       },
     };
     this._sendDirect(data);
-    this.log(`client.realtimeInput`, message);
   }
 
   /**
@@ -295,6 +427,13 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
       parts,
     };
 
+    // Log user's text input if present
+    for (const part of parts) {
+      if ('text' in part && part.text) {
+        this.log("user.text", `👤 USER SAYS: ${part.text}`);
+      }
+    }
+
     const clientContentRequest: ClientContentMessage = {
       clientContent: {
         turns: [content],
@@ -303,7 +442,6 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
     };
 
     this._sendDirect(clientContentRequest);
-    this.log(`client.send`, clientContentRequest);
   }
 
   /**
@@ -318,3 +456,4 @@ export class MultimodalLiveClient extends EventEmitter<MultimodalLiveClientEvent
     this.ws.send(str);
   }
 }
+
